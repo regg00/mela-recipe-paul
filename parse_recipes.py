@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Parse recipes from docx and generate .melarecipes file for Mela app."""
 
+import argparse
+import base64
 import json
 import re
 import uuid
 import zipfile
 import os
 from docx import Document
+from docx.oxml.ns import qn
 
 DOCX_PATH = "/Users/regis.tremblay-lefrancois/Downloads/mela/2025-03-28_Recettes.docx"
 OUTPUT_DIR = "/Users/regis.tremblay-lefrancois/Downloads/mela/recipes"
@@ -93,6 +96,29 @@ def get_section_type(text):
     return None
 
 
+def extract_images_from_paragraph(para, doc_part):
+    """Extract base64-encoded images from a paragraph's inline drawings.
+    Returns a list of base64 strings. Skips EMF and oversized images."""
+    images = []
+    for run in para.runs:
+        for drawing in run._element.findall(qn('w:drawing')):
+            for blip in drawing.findall('.//' + qn('a:blip')):
+                embed = blip.get(qn('r:embed'))
+                if not embed:
+                    continue
+                rel = doc_part.rels.get(embed)
+                if not rel or rel.is_external:
+                    continue
+                img_part = rel.target_part
+                # Skip EMF (vector format, huge) and tiny images (<1KB likely icons)
+                if img_part.content_type == 'image/x-emf':
+                    continue
+                if len(img_part.blob) < 1000:
+                    continue
+                images.append(base64.b64encode(img_part.blob).decode('ascii'))
+    return images
+
+
 def is_url(text):
     """Check if text is or starts with a URL."""
     return bool(re.match(r'https?://', text.strip()))
@@ -159,8 +185,10 @@ def parse_recipes(docx_path):
                 if current_subcategory:
                     categories.append(current_subcategory)
 
+            # Extract images from the title heading itself
+            title_images = extract_images_from_paragraph(para, doc.part)
             i += 1
-            recipe, i = parse_single_recipe(paragraphs, i, recipe_title, categories)
+            recipe, i = parse_single_recipe(paragraphs, i, recipe_title, categories, doc.part, title_images)
             recipes.append(recipe)
             continue
 
@@ -169,7 +197,7 @@ def parse_recipes(docx_path):
     return recipes
 
 
-def parse_single_recipe(paragraphs, start_idx, title, categories):
+def parse_single_recipe(paragraphs, start_idx, title, categories, doc_part, initial_images=None):
     """Parse a single recipe. Returns (recipe_dict, next_index)."""
     recipe = {
         'id': str(uuid.uuid4()),
@@ -194,17 +222,26 @@ def parse_single_recipe(paragraphs, start_idx, title, categories):
     notes_lines = []
     preamble_lines = []
     urls = []
+    recipe_images = list(initial_images or [])
 
     while i < len(paragraphs):
         para = paragraphs[i]
         text = para.text.strip()
         style = para.style.name
 
+        # Extract images from every paragraph in this recipe's range
+        # (before any break check, so we don't miss images on boundary paragraphs)
+
+
         # Stop at next recipe or category
         if style == 'Heading 1' and text:
             break
         if style in ('Heading 2', 'Heading 3') and text:
             break
+
+        # Extract images from this paragraph
+        para_images = extract_images_from_paragraph(para, doc_part)
+        recipe_images.extend(para_images)
 
         if not text:
             i += 1
@@ -342,6 +379,7 @@ def parse_single_recipe(paragraphs, start_idx, title, categories):
     recipe['instructions'] = '\n'.join(instructions_lines)
     recipe['notes'] = '\n'.join(notes_lines)
     recipe['text'] = '\n'.join(preamble_lines) if preamble_lines else ''
+    recipe['images'] = recipe_images
     if urls:
         recipe['link'] = urls[0]
 
@@ -363,7 +401,7 @@ def sanitize_filename(name, seen):
     return safe
 
 
-def main():
+def main(bundle=False):
     print("Parsing recipes from docx...")
     recipes = parse_recipes(DOCX_PATH)
 
@@ -387,22 +425,26 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Print summary
-    print(f"{'#':<4} {'Title':<55} {'Category':<25} {'Ingr':<5} {'Instr':<5} {'Link'}")
-    print("-" * 120)
+    total_with_img = sum(1 for r in non_empty if r['images'])
+    print(f"Recipes with images: {total_with_img}/{len(non_empty)}\n")
+
+    print(f"{'#':<4} {'Title':<55} {'Category':<25} {'Ingr':<5} {'Instr':<5} {'Img':<4} {'Link'}")
+    print("-" * 125)
     for idx, r in enumerate(non_empty, 1):
         cats = ', '.join(r['categories'])[:24]
         n_ing = len([l for l in r['ingredients'].split('\n') if l.strip()]) if r['ingredients'] else 0
         n_ins = len([l for l in r['instructions'].split('\n') if l.strip()]) if r['instructions'] else 0
+        n_img = len(r['images'])
         title = r['title'][:53]
         link = 'Y' if r['link'] else ''
-        print(f"{idx:<4} {title:<55} {cats:<25} {n_ing:<5} {n_ins:<5} {link}")
+        print(f"{idx:<4} {title:<55} {cats:<25} {n_ing:<5} {n_ins:<5} {n_img:<4} {link}")
 
     # Add 'Paul' category to all recipes
     for r in non_empty:
         if 'Paul' not in r['categories']:
             r['categories'].insert(0, 'Paul')
 
-    # Write individual .melarecipe files (no ZIP bundle)
+    # Write individual .melarecipe files
     seen_names = set()
     print(f"\nWriting individual .melarecipe files...")
     for r in non_empty:
@@ -411,9 +453,23 @@ def main():
         with open(fpath, 'w', encoding='utf-8') as f:
             json.dump(r, f, ensure_ascii=False, indent=2)
 
-    print(f"\nCreated {len(non_empty)} .melarecipe files in: {OUTPUT_DIR}/")
-    print(f"\nTo import into Mela: select all files in Finder and open with Mela")
+    print(f"Created {len(non_empty)} .melarecipe files in: {OUTPUT_DIR}/")
+
+    # Optionally bundle into a single .melarecipes file
+    if bundle:
+        print(f"\nBundling into {OUTPUT_ZIP}...")
+        with zipfile.ZipFile(OUTPUT_ZIP, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fname in os.listdir(OUTPUT_DIR):
+                if fname.endswith('.melarecipe'):
+                    zf.write(os.path.join(OUTPUT_DIR, fname), fname)
+        print(f"Created: {OUTPUT_ZIP}")
+
+    print(f"\nTo import into Mela: double-click the .melarecipe(s) files")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Parse recipes from docx into Mela format.')
+    parser.add_argument('--bundle', action='store_true',
+                        help='Also create a single .melarecipes ZIP file for sharing')
+    args = parser.parse_args()
+    main(bundle=args.bundle)
